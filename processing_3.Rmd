@@ -1,0 +1,790 @@
+---
+title: "img_process_3"
+author: "Mihkail Cornell"
+date: "11/18/2021"
+output: html_document
+---
+
+
+```{r Import libraries and set up file path}
+library(tidyverse)
+library(OpenImageR)
+library(jpeg)
+library(EBImage)
+library(tidymodels)
+
+path_to_img <- "../landmark_images"
+
+img_files <- 
+  list.files(
+    path_to_img,
+    all.files = TRUE,
+    full.names = TRUE, 
+    recursive = TRUE,
+    no.. = TRUE
+  )
+```
+
+
+```{r}
+# Set default image size
+images_dim <- 65
+
+# Extract rgb from each image
+# Extract the individual color value matrices
+img_rgb <- function(rgb){
+  r <- as.vector(rgb[ , , 1])
+  g <- as.vector(rgb[ , , 2])
+  b <- as.vector(rgb[ , , 3])
+  
+  img_to_rgb <- t(c( r, g, b))
+  
+  return (img_to_rgb)
+}
+
+img_read <- function(img, images_dim, rgb_func = img_rgb){
+  image <- readJPEG(img)
+  read_img <-
+    resizeImage(
+       image,
+       width = images_dim,
+       height = images_dim,
+       method = 'nearest'
+     )
+
+  image <- as.numeric(rgb_func(read_img))
+  
+  return (image)
+}
+
+```
+
+
+```{r Looping for the files}
+images_data <- NULL
+
+# function for image processing
+image_process <- 
+  function(image_files, 
+           images_data, 
+           rgb_func,
+           img_read, 
+           images_path,
+           images_dim){
+    
+    images_matrix  <- images_data
+    
+    for(img_file in image_files){
+      image_file  <- img_read(img_file, images_dim, rgb_func)
+
+      images_matrix  <- rbind(images_matrix, image_file)
+  
+    }
+    
+      rownames(images_matrix) <- list.files(images_path, recursive = TRUE)
+    
+    return(images_matrix)
+  }
+
+
+# converted all images into vector representation
+# the RGB values are concatenated into 1 * 30000 long vector
+# Creating the dataset
+image_data_matrix <-
+  image_process(img_files, 
+                images_data, 
+                img_rgb,
+                img_read, 
+                path_to_img,
+                images_dim)
+
+
+
+```
+
+```{r}
+# extract both names and class
+# cbind with image_data_matrix
+
+number_of_cols <- images_dim^2 * 3
+
+  names_and_class <- matrix(0, nrow = length(img_files), ncol = 2)
+  for(file in 1:length(img_files)){
+    
+    className <- unlist(strsplit(img_files[file], split = "/"))[[3]]
+    imgName   <- unlist(strsplit(img_files[file], split = "/"))[[4]]
+    
+    names_and_class[file, 1] <-  className
+    names_and_class[file, 2] <-  imgName
+  }
+  
+  # merge image names and image class names
+  # into the image data matrix
+  merged_images_data <- cbind(names_and_class, 
+                              image_data_matrix)
+  
+  # write.table(merged_images_data, file = "images_data.txt", sep = " ; ")
+  
+  colnames(merged_images_data) <- c("image_class",
+                                    "image_names",
+                                    paste0(1:number_of_cols,
+                                           rep(" color_scheme", number_of_cols)))
+
+# write.csv(merged_images_data, "images_data.csv")
+  
+# data matrix is now assembled
+
+```
+
+*Calculating Principal Components using Covariance Method*
+```{r}
+
+# Algorithm to create the face space for projection
+# Center and scale the data
+scaled_images <-
+  scale(image_data_matrix, center = TRUE, scale = TRUE)
+
+# column means and standard deviation
+mean_images <- attr(scaled_images, "scaled:center")
+std_images  <- attr(scaled_images, "scaled:scale")
+
+
+# Calculate the covariance matrix. 
+covariance_matrix <- scaled_images%*%t(scaled_images) / (nrow(scaled_images)-1)
+
+# computation of eigenvalues from covariance matrix
+# this corresponds to the pc of the data
+eigen_value_computed <- eigen(covariance_matrix)
+eigenvalues          <- eigen_value_computed$values
+eigenvectors         <- eigen_value_computed$vectors
+
+
+# proportion of variation
+proportion_of_variation  <- eigenvalues / sum(eigenvalues)
+
+# cumulative sum of eigenvalues
+cumulative_sum_variation <- cumsum(eigenvalues) / sum(eigenvalues)
+
+# determines the number of eigenvalues to be preserved
+threshold_value          <- min(which(cumulative_sum_variation > .90))
+
+# scaling factor
+scaling_factor <- 
+  diag(eigenvalues[1:threshold_value]^(-1/2)) / (sqrt(nrow(scaled_images)-1))
+
+# new matrix that represents the top 90% eigenvectors
+eigenimages  <- t(scaled_images)%*%eigenvectors[,1:threshold_value]%*%scaling_factor
+
+
+# eigenimage 10
+eigenimage_10 <- array(eigenimages[, 10], c(images_dim, images_dim, 3))
+
+# new projection
+# projecting the training images 
+# by the Covariance Matrix Method
+# this is now the PCA image space
+projected_data_covmat <- data.frame(PC = t(t(eigenimages)%*%t(scaled_images)))
+
+attr(projected_data_covmat, "mean")  <- mean_images
+attr(projected_data_covmat, "scale") <- std_images
+attr(projected_data_covmat, "eigenvectors")  <- eigenvectors
+attr(projected_data_covmat, "eigenvalues") <- eigenvalues
+```
+
+
+*normalized eigenvectors*
+*desired number of eigenvectors is chosen by the computed threshold (threshold_value)*
+```{r}
+# selecting eigenvector with the desired k largest eigenvalues
+# eigenvector is normalized
+# and project the unknown image
+
+# normalized eigenvectors
+eigenimages_normalized <- scale(eigenimages, 
+                                center = TRUE, 
+                                scale = TRUE)
+
+# normalized eigenvectors projected to 
+# the normalized original data 
+normeig_projected_data <- data.frame(PC = t(t(eigenimages_normalized)%*%t(scaled_images)))
+```
+
+
+*calculation of threshold value in classification*
+*calculate the minimum distance of each image from the training base*
+*from the other images and place that distance in a vector rast*
+```{r}
+library(philentropy)
+
+distance_from_each_image <- projected_data_covmat
+ 
+distances_measures   <- matrix(0, 
+                               nrow = nrow(projected_data_covmat),
+                               )
+
+# minimum distances of each image from
+# the training base from other images
+minimum_distances <- matrix(0, nrow = nrow(distance_from_each_image))
+
+for(i in seq(1, nrow(distance_from_each_image))){
+
+  minimum_distance <- 
+    as.matrix(dist(distance_from_each_image))[i, ]
+  
+  minimum_distances[i, ] <- min(minimum_distance[which(minimum_distance > 0)])
+  
+}
+
+##########################################
+#######with normalized eigenvectors#######
+min_dist_normeig  <- normeig_projected_data
+
+distances_normeig   <- matrix(0, 
+                               nrow = nrow(min_dist_normeig),
+                               )
+
+minimum_normeig <- matrix(0, nrow = nrow(distances_normeig))
+
+for(i in seq(1, nrow(distances_normeig))){
+
+  minimum_distance <- 
+    as.matrix(dist(min_dist_normeig))[i, ]
+  
+  minimum_normeig[i, ] <- min(minimum_distance[which(minimum_distance > 0)])
+  
+}
+
+
+
+```
+
+*Create the test dataset*
+```{r}
+# given an unknown image, convert into vector form
+# project the unknown image on the PCA space
+sample_imgdata <- NULL
+
+path_samples <- "../test_files"
+
+img_samples <- 
+  list.files(
+    path_samples,
+    all.files  = TRUE,
+    full.names = TRUE, 
+    recursive  = TRUE,
+    no..       = TRUE
+  )
+
+
+sample_image_process <-
+  image_process(
+    img_samples,
+    sample_imgdata,
+    img_rgb,
+    img_read, 
+    path_samples,
+    images_dim
+  )
+
+
+# function to create sample data
+naming_data <- 
+  function(samples_files, sample_images, length = number_of_cols){
+  
+  sample_images_named <- matrix(0, nrow = length(samples_files), ncol = 2)
+  
+  for(file in 1:length(samples_files)){
+    
+    class_named   <- unlist(strsplit(samples_files[file], split = "/"))[[3]]
+    image_named   <- unlist(strsplit(samples_files[file], split = "/"))[[4]]
+    
+    sample_images_named[file, 1] <- class_named 
+    sample_images_named[file, 2] <- image_named
+  }
+  
+  # merge image names and image class names
+  # into the image data matrix
+  sample_images  <- cbind(sample_images_named, 
+                          sample_images)
+  
+  colnames(sample_images) <- c("image_class",
+                               "image_names",
+                                    paste0(1:length,
+                                           rep(" color_scheme", length)))
+  
+  return (sample_images)
+}
+
+# run function
+samples_named_df <- naming_data(img_samples,
+                                sample_image_process)
+
+
+samples_data_matrix <- as.array(samples_named_df[ , -1:-2], 
+                                dim = c(images_dim, images_dim, 
+                                        nrow(samples_named_df)))
+
+samples_names <- samples_named_df[ , 1]
+
+
+samples_data_numeric <- 
+  matrix(as.numeric(samples_data_matrix),
+         nrow(samples_named_df))
+
+# samples normalized by the values
+# from the training dataset
+unknown_norm_sample <- scale(samples_data_numeric, 
+                             center = mean_images, 
+                             scale = std_images)
+
+projected_unknown_sample <- t(t(eigenimages) %*% t(unknown_norm_sample))
+
+rownames(projected_unknown_sample) <- samples_names
+
+projected_unknown_sample <- matrix(projected_unknown_sample, 
+                                   ncol = ncol(projected_unknown_sample),
+                                   nrow = nrow(unknown_norm_sample))
+
+```
+
+*these samples were projected to the normalized eigenvalues*
+```{r}
+
+
+projected_normeig_sample <- t(t(eigenimages_normalized) %*% t(unknown_norm_sample))
+
+rownames(projected_normeig_sample) <- samples_names
+
+projected_normeig_sample <- matrix(projected_normeig_sample, 
+                                   ncol = ncol(projected_normeig_sample),
+                                   nrow = nrow(unknown_norm_sample))
+
+```
+
+```{r Processing of samples for distance recognition}
+library(philentropy)
+library(stringr)
+
+
+distance_classifier <- 
+  function(projected_data, projected_sample, method = "euclidean"){
+
+      observed_vs_samples <- matrix(0, 
+                                    nrow = nrow(projected_data) *
+                                           nrow(projected_sample),
+                                    ncol = 3 + nrow(projected_sample))
+      
+      colnames(observed_vs_samples) <- c("observed_class",
+                                         "observed_name",
+                                         "sample_class",
+                                         rep(paste0("euclidean_distance_with_", 
+                                                    samples_names)))
+      
+      observed_indexes <- rep(1:nrow(projected_data), 
+                      nrow(projected_sample))
+      
+      sample_seq <- seq(1, nrow(projected_sample))
+      
+      sample_indexes <- rep(sample_seq, nrow(projected_data))
+      
+      
+      observed_class_name <- rep(rownames(projected_data),
+                                 nrow(projected_sample))
+      
+      obs_vs_sample_seq <- seq(1, nrow(projected_data) *
+                   nrow(projected_sample))
+    
+    
+      for(o in obs_vs_sample_seq){
+    
+        index_observed     <- observed_indexes[o]
+        
+        index_sample       <- sample_indexes[o]
+        
+        observed_name      <- strsplit(observed_class_name[index_observed],
+                                       split = "/")[[1]][1]
+    
+        sample_class       <- unlist(strsplit(unlist(strsplit(img_samples[index_sample],
+                                                       split = "/"))[4], split = ".jpg")[1])
+    
+    
+        sample_image_distance  <- rbind(projected_data[index_observed, ],
+                                    projected_sample[index_sample, ])
+    
+        distance_measure     <- distance(sample_image_distance, 
+                                         method = method)
+    
+    
+        observed_vs_samples[o, 1]   <- o
+    
+        observed_vs_samples[o, 2]   <- observed_name
+    
+        observed_vs_samples[o, 3]   <- sample_class
+    
+        observed_vs_samples[o, length(img_samples) + index_sample] <-
+          distance_measure
+      }
+      
+      return(observed_vs_samples)
+  }
+
+
+# euclidean distance classification
+# non-normalized eigenvectors
+
+projected_with_base_eigenvectors <- distance_classifier(projected_data_covmat, 
+                                                        projected_unknown_sample)
+
+projected_with_base_eigenvectors <- as_tibble(projected_with_base_eigenvectors)
+
+
+
+
+
+# NORMALIZED Eigenvectors
+projected_normalized_eigenvectors <- distance_classifier(normeig_projected_data, 
+                                                        projected_normeig_sample)
+
+
+projected_normalized_eigenvectors <- as_tibble(projected_normalized_eigenvectors)
+```
+
+```{r}
+
+library(tidyverse)
+
+
+measured_distance <-
+  projected_normalized_eigenvectors %>%
+  mutate(observed_class     = as_factor(observed_class),
+         observed_name      = as_factor(observed_name),
+         sample_class       = as_factor(sample_class),
+         distance_same      = as.numeric(euclidean_distance_with_same),
+         distance_exact     = as.numeric(euclidean_distance_with_exact),
+         distance_notData   = as.numeric(euclidean_distance_with_notData))
+
+
+measured_distance %>%
+  filter(sample_class == "exact_test") %>%
+  ggplot(aes(observed_class, distance_exact, color = observed_name)) +
+  geom_point(size = 2, alpha = 1.7) +
+  geom_hline(yintercept = 7432.6216, color = "red", alpha = 0.5, lty = 2, size = 1.3) +
+  theme_classic() + 
+  ggtitle("Images were exactly similar") +
+  labs(y = "Euclidean distance",
+       x = "Image number",
+       color = "Image classes")
+
+
+
+measured_distance %>%
+  filter(sample_class == "same_test") %>%
+  ggplot(aes(observed_class, distance_same, color = observed_name)) +
+  geom_point(size = 2, alpha = 1.7) +
+  geom_hline(yintercept = 7432.6216, color = "red", alpha = 0.5, lty = 2, size = 1.3) +
+  theme_classic() +
+  ggtitle("Image is in data") +
+  labs(y = "Euclidean distance",
+       x = "Image number",
+       color = "Image classes")
+
+
+measured_distance %>%
+  filter(sample_class == "notData_test") %>%
+  ggplot(aes(observed_class, distance_notData, color = observed_name)) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_hline(yintercept = 7432.6216, color = "#ff9900", alpha = 0.5, lty = 2, size = 1.3) +
+  theme_classic() + 
+  ggtitle("Image unknown") +
+  labs(y = "Euclidean distance",
+       x = "Image number",
+       color = "Image classes")
+```
+
+
+```{r Building model with Random Forest and PCA with prediction}
+# manual PCA
+library(caret)
+
+
+img_pca <- prcomp(image_data_matrix,
+                  center = TRUE,
+                  scale. = TRUE)
+
+std_dev <- img_pca$sdev
+
+proportion_of_variance <- std_dev^2
+
+proportion_variance_explained <-
+  proportion_of_variance/sum(proportion_of_variance)
+
+cumulative_sum_variation_explained <- cumsum(proportion_variance_explained)
+
+# 18 pc's explain 90% of the variance
+principal_components_threshold <-
+  min(which(cumulative_sum_variation_explained > .90))
+
+# create plot
+plot(cumulative_sum_variation_explained, 
+     xlab = "Principal Components",
+     ylab = "Cumulative Proportion of Variance Explained",
+     type = "b")
+
+abline(h   = 0.90,
+       col = 'red',
+       v   = principal_components_threshold)
+##
+
+train_data <- img_pca$x[, 1:principal_components_threshold]
+
+data_labelled <- data.frame(class = merged_images_data[ , 1], 
+                            train_data)
+```
+
+
+```{r Building model RF regression with prediction}
+metric  <- "Accuracy"
+
+control <- trainControl(method  = "repeatedcv", 
+                        number  = 10, 
+                        repeats = 3)
+
+mtry     <- sqrt(ncol(train_data))
+tunegrid <- expand.grid(.mtry = mtry)
+
+doParallel::registerDoParallel()
+set.seed(4523)
+
+
+model_rf <- 
+  train(class ~ . ,
+        data   = data_labelled, 
+        method = "rf", 
+        metric = metric, 
+        tuneGrid  = tunegrid, 
+        trControl = control)
+
+
+prediction_random_forest <- predict(model_rf,
+                                    new_data = data_labelled)
+
+# Confusion Matrix and Statistics
+confusionMatrix(prediction_random_forest,
+                as.factor(data_labelled$class))
+
+
+
+# using unprocessed samples
+test_data       <- samples_data_numeric
+
+pca_test_data   <- predict(img_pca, 
+                           newdata = test_data)
+
+test_df         <- as.data.frame(pca_test_data)
+
+predict_test_df <- predict(model_rf, test_df, type = "prob")
+
+```
+
+```{r Building SVM model}
+library(e1071)
+library(tidymodels)
+
+# create indicator for class `cathedral`
+# coding the data as 1 for class `cathedral`
+# and -1 for non-cathedral class
+svm_data <- data_labelled
+
+  for(i in seq(1, nrow(svm_data), 1)) {
+    if(svm_data[["class"]][i] == "cathedral"){
+        svm_data[["is_cathedral"]][i] =  1
+    } else {
+        svm_data[["is_cathedral"]][i] = -1
+    }
+  }
+
+binaryClass_df <- svm_data[,2:ncol(svm_data)]
+
+svmLinear_model <- 
+  svm(
+    is_cathedral ~ . ,
+    data   = binaryClass_df,
+    type   = "C-classification",
+    kernel = "linear",
+  )
+
+summary(svmLinear_model)
+
+
+prediction_svmLinear_model <- predict(svmLinear_model,
+                                      binaryClass_df,
+                                      type = "class")
+
+# Confusion Matrix
+confusionMatrix(as.factor(prediction_svmLinear_model),
+                as.factor(test_df$is_cathedral))
+
+
+predict(svmLinear_model, test_df)
+```
+
+
+
+
+
+
+
+
+```{r Building PolynomialKernel SVM model}
+########## PolynomialKernel
+svmPoly_model <- 
+  svm(
+    is_cathedral ~ . ,
+    data   = svm_data[,2:ncol(svm_data)],
+    type   = "C-classification",
+    kernel = "polynomial",
+    gamma  = 2^(1/nrow(svm_data)),
+    cost   = 5
+  )
+
+
+summary(svmPoly_model)
+
+
+prediction_svmPoly_model <- predict(svmPoly_model,
+                                    binaryTest_df,
+                                    type = "class")
+
+confusionMatrix(as.factor(prediction_svmPoly_model),
+                as.factor(binaryTest_df$is_cathedral))
+```
+
+
+```{r Testing samples, coded 1 `cathedral` class, -1 otherwise}
+# Column names list
+column_names   <- colnames(svm_data)[-1]
+
+
+# using unprocessed samples
+testing_data   <- projected_unknown_sample[ , 1:threshold_value]
+  
+
+testing_data   <- cbind(c(-1, -1, 1), testing_data)
+
+test_df        <- as.data.frame(testing_data)
+
+colnames(test_df) <- column_names[c(length(column_names),
+                                     1:(length(column_names) - 1))]
+
+binaryTest_df <- 
+  test_df %>%
+  mutate(is_cathedral = as.factor(is_cathedral))
+```
+
+
+```{r "Cathedral" "Non-cathedral" Binary coding of testing data}
+
+
+binaryClass_df$is_cathedral <- as.factor(binaryClass_df$is_cathedral)
+
+
+binaryClass_df$is_cathedral <- ifelse(binaryClass_df$is_cathedral == 1,
+                                      "Cathedral",
+                                      "Non-cathedral")
+
+binaryClass_df$is_cathedral <- as.factor(binaryClass_df$is_cathedral)
+
+
+
+test_df$is_cathedral <- 
+  ifelse(test_df$is_cathedral == 1,
+         "Cathedral",
+         "Non-cathedral") %>% 
+  as.factor()
+```
+
+
+```{r Random Forest ranger model ("Cathedral", "Non-cathedral")}
+
+library(randomForest)
+library(caret)
+
+doParallel::registerDoParallel()
+set.seed(7223)
+
+rfBinary_model <- 
+  randomForest(
+        is_cathedral ~ . ,
+        data           =   binaryClass_df,
+        proximity      =   TRUE
+        )
+
+
+prediction_rfBinary <- predict(rfBinary_model,
+                               data = binaryClass_df)
+
+confusionMatrix(as.factor(prediction_rfBinary$predictions),
+                as.factor(binaryTest_df$is_cathedral))
+
+
+predict_test_df <- predict(model_rfBinary, test_df)
+
+
+
+# oob_df <- data.frame(
+#      Trees = rep(1:nrow(rfBinary_model$err.rate), times = 3),
+#      Type  = rep(c("OOB", "Cathedral", "Non-cathedral"), 
+#                  each = nrow(rfBinary_model$err.rate)),
+#      Error = c(rfBinary_model$err.rate[, "OOB"],
+#                rfBinary_model$err.rate[, "Cathedral"],
+#                rfBinary_model$err.rate[,"Non-cathedral"]))
+# 
+# 
+# 
+# oob_df %>%
+#   ggplot(aes(Trees, Error, color = Type)) +
+#   geom_line(alpha = 0.8, size = 0.8) +
+#   theme(axis.title = element_text(family = "Trebuchet MS", 
+#                                   color  = "#666666", 
+#                                   face   = "bold", 
+#                                   size   = 12))
+
+
+```
+
+
+```{r SVM model with Binary coded data (1, -1)}
+library(e1071)
+
+doParallel::registerDoParallel()
+set.seed(7291)
+
+svmLinear_model <- 
+  
+
+prediction_rfBinary <- predict(rfBinary_model,
+                               data = binaryTest_df)
+
+confusionMatrix(as.factor(prediction_rfBinary$predictions),
+                as.factor(binaryTest_df$is_cathedral))
+
+
+predict_test_df <- predict(model_rfBinary, test_df)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
